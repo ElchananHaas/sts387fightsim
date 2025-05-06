@@ -196,7 +196,7 @@ impl GameState {
         self.hand.swap_remove(worst.expect("Hand is nonempty").0);
     }
 
-    //This is a bad ordering and is very situational.
+    //Discard is very situational and this is sometimes a bad ordering.
     fn dont_discard_score(&self, card: Card) -> i32 {
         match card {
             Card::Defend => 50,
