@@ -1,6 +1,7 @@
 #![feature(random)]
 #![feature(int_roundings)]
 
+use rand::{distr::weighted::WeightedIndex, prelude::*, seq::index::sample_weighted};
 use std::random::{DefaultRandomSource, Random};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -21,6 +22,9 @@ enum Card {
     Void,
 }
 
+const STARTING_ENERGY: i32 = 5;
+const NUM_CARDS: usize = Card::Void as usize + 1;
+const NUM_FEATURES: usize = 22;
 impl Card {
     fn energy(&self) -> Option<i32> {
         match self {
@@ -114,7 +118,37 @@ struct GameState {
     attacks_played: i32,
 }
 
+fn encode_1_hot(num: i32, max: i32, features: &mut Vec<f32>) {
+    for i in 0..=max {
+        features.push((i == num) as i32 as f32);
+    }
+}
 impl GameState {
+    //28 features.
+    fn features(&mut self) -> Vec<f32> {
+        let mut res = Vec::new();
+        res.push((self.life_after_hit() as f32) / 30f32);
+        res.push(1f32);
+        encode_1_hot(self.energy, STARTING_ENERGY, &mut res);
+        encode_1_hot(self.hand.len() as i32, 6, &mut res);
+        encode_1_hot(self.intangible as i32, 1, &mut res);
+        encode_1_hot(self.attacks_played, 2, &mut res);
+        encode_1_hot((self.weak > 0) as i32, 1, &mut res);
+
+        res
+    }
+
+    fn playable_actions(&self) -> Vec<usize> {
+        let mut res: Vec<usize> = Vec::new();
+        for i in 0..self.hand.len() {
+            if let Some(energy) = self.hand[i].energy()
+                && self.energy >= energy
+            {
+                res.push(i);
+            }
+        }
+        res
+    }
     fn play_card(&mut self, card_idx: usize) {
         let card = self.hand.swap_remove(card_idx);
         let energy = card.energy().expect("Card is playable");
@@ -126,6 +160,10 @@ impl GameState {
         self.life -= if self.intangible { 0 } else { 1 }; //Beat of Death
         self.life += card.block();
         self.attacks_played += if card.is_attack() { 1 } else { 0 };
+        if self.attacks_played == 3 {
+            self.attacks_played = 0;
+            self.life += 4;
+        }
         self.weak += card.weak();
         if self.weak > 0 && card == Card::HeelHook {
             self.energy += 1;
@@ -165,23 +203,25 @@ impl GameState {
         }
         None
     }
-    fn survive(&self) -> Option<i32> {
-        let mod_life = self.life + 4 * (self.attacks_played.div_floor(3));
+
+    fn life_after_hit(&self) -> i32 {
         if self.intangible {
-            Some(mod_life - 1)
+            self.life - 1
         } else {
             let modified_dmg = if self.weak > 0 {
                 ((self.heart_dmg as f32) * 1.5 * 0.75) as i32
             } else {
                 ((self.heart_dmg as f32) * 1.5) as i32
             };
-            if mod_life > modified_dmg {
-                Some(mod_life - modified_dmg)
-            } else {
-                None
-            }
+            self.life - modified_dmg
         }
     }
+
+    fn survive(&self) -> Option<i32> {
+        let life = self.life_after_hit();
+        if life > 0 { Some(life) } else { None }
+    }
+
     fn discard(&mut self) {
         let worst = self
             .hand
@@ -215,6 +255,112 @@ impl GameState {
             Card::Void => 3,
         }
     }
+}
+
+struct MlState {
+    state: Vec<Vec<f32>>,
+}
+
+impl MlState {
+    fn new() -> Self {
+        Self {
+            state: vec![vec![0f32; NUM_FEATURES]; NUM_CARDS + 1],
+        }
+    }
+}
+
+fn simulate_ml(state: &mut GameState, ml: &mut MlState, print: bool) -> bool {
+    let mut action_log = Vec::new();
+    loop {
+        let actions = state.playable_actions();
+        let chosen = choose_action_ml(&actions, state, ml);
+        if print { 
+            dbg!(&chosen);
+        }
+        if chosen.1 == actions.len() {
+            if print { 
+                dbg!("Ended");
+            }
+            break;
+        } else {
+            if print {
+                dbg!(state.hand[actions[chosen.1]]);
+            }
+            state.play_card(actions[chosen.1]);
+        }
+        action_log.push(chosen);
+    }
+    let score = if state.survive().is_some() {1f32} else {-1f32};
+    update(&action_log, ml, score);
+    state.survive().is_some()
+}
+
+const LR: f32 = 0.003;
+
+fn update(action_log: &Vec<(Vec<f32>, usize, Vec<f32>, Vec<usize>)>, ml: &mut MlState, score: f32) {
+    for (probs, chosen, features, action_entries) in action_log {
+        for i in 0..probs.len() {
+            let deriv = if i == *chosen {
+                probs[i] * (1f32 - probs[i])
+            } else {
+                -(probs[i] * probs[*chosen])
+            };
+            let weight_idx = action_entries[i];
+            for j in 0..ml.state[weight_idx].len() {
+                ml.state[weight_idx][j] += score * features[j] * deriv * LR;
+            }
+        }
+    }
+}
+
+fn choose_action_ml(
+    actions: &Vec<usize>,
+    state: &mut GameState,
+    ml: &MlState,
+) -> (Vec<f32>, usize, Vec<f32>, Vec<usize>) {
+    let features = state.features();
+    let mut action_logits = Vec::new();
+    let mut action_entries = Vec::new();
+    for action in actions {
+        let card = state.hand[*action];
+        action_entries.push(card as usize);
+        compute_logit(&mut action_logits, ml, &features, card as usize);
+    }
+    //This is the action for taking None
+    action_entries.push(NUM_CARDS);
+    compute_logit(&mut action_logits, ml, &features, NUM_CARDS);
+    let mut max = action_logits[0];
+    for &logit in &action_logits {
+        if logit > max {
+            max = logit;
+        }
+    }
+    for i in 0..action_logits.len() {
+        action_logits[i] -= max;
+    }
+    let mut sumexp = 0f32;
+    for &logit in &action_logits {
+        sumexp += logit.exp();
+    }
+    let logsumexp = sumexp.ln();
+    for i in 0..action_logits.len() {
+        action_logits[i] -= logsumexp;
+    }
+    let probs: Vec<f32> = action_logits.iter().map(|x| x.exp()).collect();
+    let dist = WeightedIndex::new(&probs).expect("Prob dist is valid");
+    let mut rng = rand::rng();
+    let sampled = dist.sample(&mut rng);
+    (probs, sampled, features, action_entries)
+}
+
+fn compute_logit(action_logits: &mut Vec<f32>, ml: &MlState, features: &Vec<f32>, idx: usize) {
+    let weights = &ml.state[idx];
+    assert!(weights.len() == features.len());
+    let mut acc: f32 = 0f32;
+    for i in 0..weights.len() {
+        acc += features[i] * weights[i];
+    }
+    action_logits.push(acc);
 }
 
 //This assumes we have already Gambled.
@@ -290,7 +436,6 @@ fn simulate(state: &mut GameState) -> bool {
     state.survive().is_some()
 }
 
-const STARTING_ENERGY: i32 = 5;
 fn dash_state() -> GameState {
     let mut state = GameState {
         life: 51,
@@ -325,7 +470,7 @@ fn gamble_state() -> GameState {
     state
 }
 fn main() {
-    let gamble_line = score(|| {
+    /*let gamble_line = score(|| {
         let mut state = gamble_state();
         simulate(&mut state)
     });
@@ -334,14 +479,31 @@ fn main() {
         let mut state = dash_state();
         simulate(&mut state)
     });
-    println!("Dash line is {}", dash_line);
+    println!("Dash line is {}", dash_line);*/
+    let mut mlstate= MlState::new();
+    for _ in 0..100 {
+        let line = score(|ctr| {
+            let mut state = dash_state();
+            simulate_ml(&mut state, &mut mlstate,false)
+        });
+        println!("Dash line is {}", line);
+    }
+    let mut mlstate= MlState::new();
+    for _ in 0..100 {
+        let line = score(|ctr| {
+            let mut state = gamble_state();
+            simulate_ml(&mut state, &mut mlstate, ctr % 2000 == 0)
+        });
+        println!("Gamble line is {}", line);
+    }
+    dbg!(&mlstate.state);
 }
 
-fn score(f: impl Fn() -> bool) -> f32 {
+fn score(mut f: impl FnMut(usize) -> bool) -> f32 {
     let mut wins = 0;
-    let count = 100000;
-    for _ in 0..count {
-        wins += if f() { 1 } else { 0 };
+    let count = 10000;
+    for c in 0..count {
+        wins += if f(c) { 1 } else { 0 };
     }
     (wins as f32) / (count as f32)
 }
