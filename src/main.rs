@@ -1,10 +1,10 @@
 #![feature(random)]
 #![feature(int_roundings)]
 
-use rand::{distr::weighted::WeightedIndex, prelude::*, seq::index::sample_weighted};
-use std::random::{DefaultRandomSource, Random};
+use rand::{distr::weighted::WeightedIndex, prelude::*};
+use std::{collections::HashMap, random::{DefaultRandomSource, Random}};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, PartialOrd, Ord, Hash)]
 enum Card {
     Defend,
     DaggerThrow,
@@ -107,6 +107,7 @@ fn create_draw_pile() -> Vec<Card> {
     draw_pile
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct GameState {
     life: i32, //This is equal to HP+Block,
     weak: i32, //Number of stacks of weak.
@@ -118,23 +119,11 @@ struct GameState {
     attacks_played: i32,
 }
 
-fn encode_1_hot(num: i32, max: i32, features: &mut Vec<f32>) {
-    for i in 0..=max {
-        features.push((i == num) as i32 as f32);
-    }
-}
 impl GameState {
-    //28 features.
-    fn features(&mut self) -> Vec<f32> {
-        let mut res = Vec::new();
-        res.push((self.life_after_hit() as f32) / 30f32);
-        res.push(1f32);
-        encode_1_hot(self.energy, STARTING_ENERGY, &mut res);
-        encode_1_hot(self.hand.len() as i32, 6, &mut res);
-        encode_1_hot(self.intangible as i32, 1, &mut res);
-        encode_1_hot(self.attacks_played, 2, &mut res);
-        encode_1_hot((self.weak > 0) as i32, 1, &mut res);
-
+    fn observables(&self) -> GameState {
+        let mut res = self.clone();
+        res.deck.sort(); //TODO - can this be discarded to speed up the simulation?
+        res.hand.sort(); //Hand is already sorted
         res
     }
 
@@ -149,6 +138,7 @@ impl GameState {
         }
         res
     }
+
     fn play_card(&mut self, card_idx: usize) {
         let card = self.hand.swap_remove(card_idx);
         let energy = card.energy().expect("Card is playable");
@@ -190,6 +180,7 @@ impl GameState {
             self.energy = 0.max(self.energy - 1);
         }
         self.hand.push(card);
+        self.hand.sort();
     }
 
     fn count(&self, card: Card) -> usize {
@@ -257,111 +248,86 @@ impl GameState {
     }
 }
 
-struct MlState {
-    state: Vec<Vec<f32>>,
+
+#[derive(Clone, Debug, PartialEq,)]
+struct QEntry {
+    taken: f32,
+    reward_sum: f32,
 }
 
-impl MlState {
-    fn new() -> Self {
-        Self {
-            state: vec![vec![0f32; NUM_FEATURES]; NUM_CARDS + 1],
+struct MctsEntry {
+    //This could be bad if an action is taken over 2^24 = 16,000,000 times. But thats very big.
+    visit_count: f32,
+    q_vals: Vec<QEntry>,
+}
+
+impl MctsEntry {
+    fn ucb(&self) -> usize {
+        for i in 0..self.q_vals.len() {
+            if self.q_vals[i].taken == 0.0 {
+                return i
+            }
         }
+        let ucb_action = self.q_vals.iter().map(|q| {
+            let mean = q.reward_sum / q.taken;
+            let ucb_adjust = f32::sqrt(EXPLORE_FACTOR * f32::ln(self.visit_count) / q.taken);
+            mean + ucb_adjust
+        }).enumerate()
+          .max_by(|(_, a), (_, b)| a.total_cmp(b))
+          .map(|(index, _)| index)
+          .expect("Non-empty list of actions");
+        ucb_action
+    }
+
+    fn update(&mut self, action: usize, reward: f32) {
+        self.visit_count += 1.0;
+        self.q_vals[action].taken += 1.0;
+        self.q_vals[action].reward_sum += reward;
     }
 }
 
-fn simulate_ml(state: &mut GameState, ml: &mut MlState, print: bool) -> bool {
-    let mut action_log = Vec::new();
+fn mcts(f: impl Fn() -> GameState) {
+    let mut total_reward = 0.0;
+    let mut value_map: HashMap<GameState, MctsEntry> = HashMap::new();
+    for i in 0..10000000 {
+        let mut state = f();
+        let reward = mcts_rollout(&mut state, &mut value_map);
+        total_reward += reward;
+        if i % 1000 == 0 {
+            println!("Average rewards are {}", total_reward/(i as f32));
+        }
+    }
+}
+//This function rolls out a game. It mutatates its input
+fn mcts_rollout(state: &mut GameState, value_map: &mut HashMap<GameState, MctsEntry>) -> f32 { 
+    let mut states = Vec::new();
+    let mut taken_actions = Vec::new();
+    let reward: f32;
     loop {
-        let actions = state.playable_actions();
-        let chosen = choose_action_ml(&actions, state, ml);
-        if print { 
-            dbg!(&chosen);
+        states.push(state.observables());
+        let mut actions = state.playable_actions();
+        actions.push(NUM_CARDS);
+        let mcts_entry = value_map.entry(state.observables())
+        .or_insert_with(|| MctsEntry {
+            visit_count: 0.0,
+            q_vals: vec![QEntry { taken: 0.0, reward_sum: 0.0 } ;actions.len()],
+        });
+        let action_idx = mcts_entry.ucb();
+        taken_actions.push(action_idx);
+        if action_idx == actions.len() - 1 {
+            reward = if state.survive().is_some() {1f32} else {0f32};
+            break; 
         }
-        if chosen.1 == actions.len() {
-            if print { 
-                dbg!("Ended");
-            }
-            break;
-        } else {
-            if print {
-                dbg!(state.hand[actions[chosen.1]]);
-            }
-            state.play_card(actions[chosen.1]);
-        }
-        action_log.push(chosen);
+        state.play_card(actions[action_idx]);
     }
-    let score = if state.survive().is_some() {1f32} else {-1f32};
-    update(&action_log, ml, score);
-    state.survive().is_some()
+    for i in 0..states.len() {
+        value_map.get_mut(&states[i]).expect("State found").update(taken_actions[i], reward);
+    }
+    reward
 }
 
 const LR: f32 = 0.003;
-
-fn update(action_log: &Vec<(Vec<f32>, usize, Vec<f32>, Vec<usize>)>, ml: &mut MlState, score: f32) {
-    for (probs, chosen, features, action_entries) in action_log {
-        for i in 0..probs.len() {
-            let deriv = if i == *chosen {
-                probs[i] * (1f32 - probs[i])
-            } else {
-                -(probs[i] * probs[*chosen])
-            };
-            let weight_idx = action_entries[i];
-            for j in 0..ml.state[weight_idx].len() {
-                ml.state[weight_idx][j] += score * features[j] * deriv * LR;
-            }
-        }
-    }
-}
-
-fn choose_action_ml(
-    actions: &Vec<usize>,
-    state: &mut GameState,
-    ml: &MlState,
-) -> (Vec<f32>, usize, Vec<f32>, Vec<usize>) {
-    let features = state.features();
-    let mut action_logits = Vec::new();
-    let mut action_entries = Vec::new();
-    for action in actions {
-        let card = state.hand[*action];
-        action_entries.push(card as usize);
-        compute_logit(&mut action_logits, ml, &features, card as usize);
-    }
-    //This is the action for taking None
-    action_entries.push(NUM_CARDS);
-    compute_logit(&mut action_logits, ml, &features, NUM_CARDS);
-    let mut max = action_logits[0];
-    for &logit in &action_logits {
-        if logit > max {
-            max = logit;
-        }
-    }
-    for i in 0..action_logits.len() {
-        action_logits[i] -= max;
-    }
-    let mut sumexp = 0f32;
-    for &logit in &action_logits {
-        sumexp += logit.exp();
-    }
-    let logsumexp = sumexp.ln();
-    for i in 0..action_logits.len() {
-        action_logits[i] -= logsumexp;
-    }
-    let probs: Vec<f32> = action_logits.iter().map(|x| x.exp()).collect();
-    let dist = WeightedIndex::new(&probs).expect("Prob dist is valid");
-    let mut rng = rand::rng();
-    let sampled = dist.sample(&mut rng);
-    (probs, sampled, features, action_entries)
-}
-
-fn compute_logit(action_logits: &mut Vec<f32>, ml: &MlState, features: &Vec<f32>, idx: usize) {
-    let weights = &ml.state[idx];
-    assert!(weights.len() == features.len());
-    let mut acc: f32 = 0f32;
-    for i in 0..weights.len() {
-        acc += features[i] * weights[i];
-    }
-    action_logits.push(acc);
-}
+const EXPLORE_FACTOR: f32 = 0.5;
 
 //This assumes we have already Gambled.
 fn simulate(state: &mut GameState) -> bool {
@@ -480,23 +446,7 @@ fn main() {
         simulate(&mut state)
     });
     println!("Dash line is {}", dash_line);*/
-    let mut mlstate= MlState::new();
-    for _ in 0..100 {
-        let line = score(|ctr| {
-            let mut state = dash_state();
-            simulate_ml(&mut state, &mut mlstate,false)
-        });
-        println!("Dash line is {}", line);
-    }
-    let mut mlstate= MlState::new();
-    for _ in 0..100 {
-        let line = score(|ctr| {
-            let mut state = gamble_state();
-            simulate_ml(&mut state, &mut mlstate, ctr % 2000 == 0)
-        });
-        println!("Gamble line is {}", line);
-    }
-    dbg!(&mlstate.state);
+    mcts(dash_state);
 }
 
 fn score(mut f: impl FnMut(usize) -> bool) -> f32 {
